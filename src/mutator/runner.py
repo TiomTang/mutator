@@ -212,6 +212,42 @@ def _typescript_plan(root: Path, source: Path) -> tuple[Command, Path]:
     return ["npm", "test"], directory
 
 
+_CSHARP_MARKERS = ("*.sln", "*.slnx")
+
+
+def _nearest_csharp(start: Path, root: Path, patterns: tuple[str, ...]) -> Path | None:
+    """The nearest directory holding one of `patterns`, before the project root."""
+
+    current = start if start.is_dir() else start.parent
+    stop = root.resolve()
+    current = current.resolve()
+    while True:
+        for pattern in patterns:
+            for found in sorted(current.glob(pattern)):
+                if found.is_file():
+                    return found
+        if current == stop or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _csharp_plan(root: Path, source: Path) -> tuple[Command, Path]:
+    """A solution when there is one, else the nearest project.
+
+    `dotnet test` builds before it runs, so a mutant that does not compile shows
+    up as a non-zero exit code. A project with several test projects in one
+    solution therefore runs all of them, which is what the coverage step saw too.
+    """
+
+    solution = _nearest_csharp(source, root, _CSHARP_MARKERS)
+    if solution is not None:
+        return ["dotnet", "test", solution.name, "--nologo", "-v", "q"], solution.parent
+    project = _nearest_csharp(source, root, ("*.csproj",))
+    if project is not None:
+        return ["dotnet", "test", project.name, "--nologo", "-v", "q"], project.parent
+    return ["dotnet", "test", "--nologo", "-v", "q"], root
+
+
 def _rust_plan(root: Path, source: Path) -> tuple[Command, Path]:
     directory = _nearest_marker(source, root, ("Cargo.toml",))
     return ["cargo", "test"], directory
@@ -229,6 +265,7 @@ _PLANS = {
     "typescript": _typescript_plan,
     "rust": _rust_plan,
     "python": _python_plan,
+    "csharp": _csharp_plan,
 }
 
 

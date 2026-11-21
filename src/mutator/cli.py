@@ -54,7 +54,7 @@ def _skipped_directory_text() -> str:
 HELP = f"""\
 Usage: mutator [options] [path-or-filter ...]
 
-Discover mutation sites in Clojure, Java, Go, TypeScript, Rust, and Python,
+Discover mutation sites in Clojure, Java, Go, TypeScript, Rust, Python, and C#,
 run the project's tests against each one, and write `.metrics/mutate` for
 uml-viewer. Namespaces and function names are the ones crapper writes into
 `.metrics/crap.edn`.
@@ -116,6 +116,11 @@ target/mutation-workers with its own copy of the mutated file. The project
 tree is left unchanged. A copy left under target/mutator-backup/ by an
 interrupted older run is restored before a non-scan run.
 
+A C# worker restores and builds the project inside its own overlay: the
+solution and project directories are real there, and each worker gets its own
+obj and bin. The run stops at four workers unless --max-workers says otherwise,
+because every worker is a whole build.
+
 Exit codes:
   0  every executed mutant was killed, or there was nothing to run
   1  usage error
@@ -129,6 +134,7 @@ Coverage, when it is produced, uses the same commands as crapper:
   TypeScript   npm run coverage, Vitest, or c8
   Rust         cargo llvm-cov or cargo tarpaulin
   Python       coverage.py LCOV
+  C#           dotnet test --collect:"XPlat Code Coverage"
 
 A site on a line the report does not mark as hit is uncovered and is not run.
 """

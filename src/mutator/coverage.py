@@ -224,6 +224,8 @@ def covered_lines(root: Path, source_path: Path, language: str) -> set[int] | No
     if language == "java":
         return _lookup(_jacoco_index(root), path)
     bundle = crapper.coverage.load_bundle(root)
+    if language == "csharp":
+        return bundle.csharp_lines(path)
     if language == "go":
         return _go_lines(root, bundle.go_profile, path)
     if language == "clojure":

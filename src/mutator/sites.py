@@ -1,10 +1,12 @@
 """Find mutation sites.
 
 Clojure follows clj-mutate's symbol rules. Go follows mutate4go, including
-one-way `*` to `/`. Java follows mutate4java. TypeScript, Rust, and Python
+one-way `*` to `/`. Java follows mutate4java. TypeScript, Rust, Python, and C#
 use the same decisions as Java, spelled in that language. TypeScript also
 mutates `??` to `||` and `?.` to `.` (removed on a call or index). JavaScript
-files use the TypeScript rules.
+files use the TypeScript rules. C# drops the `?` of `?.` and turns `is` into
+`is not`; it leaves `??` alone, because `??` is usually not a boolean and the
+result would not compile.
 """
 
 from __future__ import annotations
@@ -38,7 +40,15 @@ _BINARY_PARENTS = {
     "boolean_operator",
 }
 
-_UNARY_PARENTS = {"unary_expression", "unary_operator", "not_operator"}
+# C# spells `!x` and `-x` as prefix_unary_expression, and `x!` (null-forgiving)
+# as postfix_unary_expression.
+_UNARY_PARENTS = {
+    "unary_expression",
+    "unary_operator",
+    "not_operator",
+    "prefix_unary_expression",
+    "postfix_unary_expression",
+}
 
 _BOOLEANS = {"true": "false", "false": "true", "True": "False", "False": "True"}
 
@@ -288,11 +298,27 @@ def _visit_binary(node, token: str, parent: str, language: str, found: list[RawS
 
 
 def _visit_optional(node, token: str, language: str, found: list[RawSite]) -> None:
-    if language != "typescript" or token != "?.":
+    if language == "typescript" and token == "?.":
+        optional = _optional_mutant(node)
+        if optional is not None:
+            _add(found, node, "?.", optional, "optional")
         return
-    optional = _optional_mutant(node)
-    if optional is not None:
-        _add(found, node, "?.", optional, "optional")
+    # C# spells `a?.b` as a `?` token inside conditional_access_expression.
+    if language == "csharp" and token == "?" and _parent_type(node) == "conditional_access_expression":
+        _add(found, node, "?", "", "optional")
+
+
+def _visit_pattern(node, token: str, parent: str, language: str, found: list[RawSite]) -> None:
+    """C# `x is Foo` becomes `x is not Foo`.
+
+    Only `is_expression` is mutated. A pattern that already says `not` would
+    become `is not not`, which does not compile, and a mutant that fails to
+    build would be scored as killed.
+    """
+
+    if language != "csharp" or token != "is" or parent != "is_expression":
+        return
+    _add(found, node, "is", "is not", "pattern")
 
 
 def _visit_not(node, token: str, parent: str, found: list[RawSite]) -> None:
@@ -334,6 +360,7 @@ def _visit_leaf(node, data: bytes, language: str, found: list[RawSite]) -> None:
     _visit_negation(node, token, parent, found)
     _visit_boolean_token(node, token, found)
     _visit_constant(node, token, found)
+    _visit_pattern(node, token, parent, language, found)
 
 
 def _visit_node(node, data: bytes, language: str, found: list[RawSite]) -> None:

@@ -8,6 +8,7 @@ the file's mutants finish.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import sys
@@ -43,6 +44,15 @@ SKIP_LINK = frozenset(
         ".mypy_cache",
         ".clj-kondo",
         ".gradle",
+        # A .NET build writes obj/ and bin/. A worker that linked them would
+        # share intermediate output with every other worker and with the
+        # project itself, and two parallel MSBuild runs then fight over the
+        # same files.
+        "bin",
+        "obj",
+        "TestResults",
+        ".vs",
+        "artifacts",
     }
 )
 
@@ -70,14 +80,27 @@ CONFIGS = (
     "requirements.txt",
     "Pipfile",
     "poetry.lock",
+    "global.json",
+    "NuGet.config",
+    "nuget.config",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "Directory.Packages.props",
 )
 
 
-def worker_count(site_count: int, requested: int | None) -> int:
+# Each C# worker runs a whole `dotnet test`, which restores and builds. One per
+# core would have sixteen MSBuild processes competing for the same disk.
+_LANGUAGE_CPU_CAP = {"csharp": 4}
+
+
+def worker_count(site_count: int, requested: int | None, language: str | None = None) -> int:
     """The smaller of the sites, the cores, and an explicit --max-workers."""
 
     processors = os.cpu_count() or 1
     limit = processors if requested is None else requested
+    if requested is None and language is not None:
+        limit = min(limit, _LANGUAGE_CPU_CAP.get(language, limit))
     return max(1, min(site_count, processors, limit))
 
 
@@ -91,7 +114,8 @@ def symlink(link: Path, target: Path) -> None:
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink() or link.exists():
         link.unlink()
-    link.symlink_to(target.resolve())
+    # Windows creates a file link unless it is told the target is a directory.
+    link.symlink_to(target.resolve(), target_is_directory=target.is_dir())
 
 
 def delete_tree(path: Path, attempts: int = 20, sleep=time.sleep) -> None:
@@ -287,12 +311,63 @@ def _overlay(worker: Path, root: Path, relative: str, original: bytes) -> None:
     destination.write_bytes(original)
 
 
+# A .NET project directory has to be real in the worker: the build writes obj/
+# and bin/ next to the project file, and a link would send those writes back
+# into the project tree.
+_PROJECT_PATTERNS = ("*.csproj", "*.sln", "*.slnx")
+
+
+def project_directories(root: Path) -> set[str]:
+    """Relative directories that hold a .NET project or solution."""
+
+    found: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_LINK]
+        if any(
+            fnmatch.fnmatch(name, pattern)
+            for name in filenames
+            for pattern in _PROJECT_PATTERNS
+        ):
+            relative = Path(dirpath).relative_to(root).as_posix()
+            if relative != ".":
+                found.add(relative)
+    return found
+
+
+def _expand_real(worker: Path, root: Path, relative: Path) -> None:
+    """A real directory in the worker whose children link to the project."""
+
+    destination = worker / relative
+    if destination.is_symlink():
+        _expand_directory(destination, root / relative)
+        return
+    if destination.exists():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    _link_children(destination, root / relative, set())
+
+
+def _expand_projects(worker: Path, root: Path, directories: set[str]) -> None:
+    """Make every project directory, and its parents, real in the worker."""
+
+    for relative in sorted(directories):
+        parts = [part for part in relative.split("/") if part and part != "."]
+        for index in range(1, len(parts) + 1):
+            _expand_real(worker, root, Path(*parts[:index]))
+
+
 def create_workers(
-    base: Path, root: Path, relative: str, original: bytes, count: int
+    base: Path,
+    root: Path,
+    relative: str,
+    original: bytes,
+    count: int,
+    language: str | None = None,
 ) -> list[Path]:
     created = []
     first = relative.split("/", 1)[0]
     importers = importers_of(root, relative)
+    projects = project_directories(root) if language == "csharp" else set()
     for index in range(count):
         worker = base / f"worker-{index}"
         worker.mkdir(parents=True, exist_ok=True)
@@ -301,6 +376,8 @@ def create_workers(
         _overlay(worker, root, relative, original)
         for importer in importers:
             _copy_importer(worker, root, importer)
+        if projects:
+            _expand_projects(worker, root, projects)
         created.append(worker)
     return created
 
@@ -438,6 +515,7 @@ def run_mutants(
     timeout: float,
     file_key: str,
     outcomes: dict[str, str],
+    language: str | None = None,
 ) -> None:
     """Mutate ``sites`` in parallel overlays of ``root``. The source stays put."""
 
@@ -447,7 +525,12 @@ def run_mutants(
     try:
         relative = source.resolve().relative_to(root.resolve()).as_posix()
         directories = create_workers(
-            base, root, relative, original, worker_count(len(sites), max_workers)
+            base,
+            root,
+            relative,
+            original,
+            worker_count(len(sites), max_workers, language),
+            language,
         )
         _run_all(
             directories,
